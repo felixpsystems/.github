@@ -1,0 +1,321 @@
+name: CI/CD — Felix L3 Widgets
+
+on:
+  push:
+    branches:
+      - develop
+      - 'release/**'
+      - 'FELCLD-*'
+  pull_request:
+    branches:
+      - develop
+      - 'release/**'
+
+env:
+  REGISTRY: 10.10.100.86
+  TERMINAL_REGISTRY_PORT: 5001
+
+concurrency:
+  group: felixl3widgets-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Step 1: Configure SSH (all downstream jobs depend on this) ────────────
+  configure-ssh:
+    name: Configure SSH
+    runs-on: [self-hosted, fps-ci, qt65]
+    outputs:
+      ssh-ready: ${{ steps.ssh.outputs.ready }}
+    steps:
+      - id: ssh
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          echo "ready=true" >> $GITHUB_OUTPUT
+
+  # ── Steps 2+3 (parallel): Clone L3s and Clone deps ────────────────────────
+  clone-l3s:
+    name: Clone L3 Widgets + felixcommon submodule
+    needs: configure-ssh
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+    steps:
+      - name: Restore SSH key
+        run: |
+          mkdir -p ~/.ssh && echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Initialise and sync felixcommon submodule
+        run: |
+          git submodule update --init felixcommon
+          cd felixcommon && git fetch origin
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          BASE="${{ github.base_ref || 'develop' }}"
+          if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
+            echo "Checking out matching branch: ${BRANCH}"
+            git checkout "${BRANCH}"
+          else
+            echo "No matching branch — using: ${BASE}"
+            git checkout "${BASE}"
+          fi
+
+      - name: Cache source tree
+        uses: actions/cache@v4
+        with:
+          path: .
+          key: l3widgets-src-${{ github.sha }}
+
+  clone-deps:
+    name: Clone Config dependencies
+    needs: configure-ssh
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+    steps:
+      - name: Restore SSH key
+        run: |
+          mkdir -p ~/.ssh && echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Clone config repo
+        run: |
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          BASE="${{ github.base_ref || 'develop' }}"
+          git clone --depth 1 https://x-access-token:${{ secrets.GH_PAT }}@github.com/felixpsystems/config.git config-repo
+          cd config-repo
+          if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
+            git checkout "${BRANCH}"
+          else
+            git checkout "${BASE}" 2>/dev/null || git checkout main 2>/dev/null || true
+          fi
+
+      - name: Cache config
+        uses: actions/cache@v4
+        with:
+          path: config-repo/
+          key: l3widgets-config-${{ github.sha }}
+
+  # ── Step 4: Build felixcommon ─────────────────────────────────────────────
+  build-common:
+    name: Build felixcommon
+    needs: clone-l3s
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Cache build
+        uses: actions/cache@v4
+        with:
+          path: felixcommon/build/
+          key: felixcommon-${{ runner.os }}-${{ hashFiles('felixcommon/**/*.pro', 'felixcommon/**/CMakeLists.txt') }}
+
+      - name: Build felixcommon
+        run: |
+          cd felixcommon
+          chmod +x build_common.sh 2>/dev/null || true
+          if [ -f build_common.sh ]; then
+            ./build_common.sh
+          else
+            mkdir -p build && cd build && cmake .. -GNinja && ninja
+          fi
+
+  # ── Steps 5+6 (parallel): Build L3s and Run Unit Tests ───────────────────
+  build-l3s:
+    name: Build L3 Widgets + Dependencies
+    needs: [build-common, clone-deps]
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Restore felixcommon build cache
+        uses: actions/cache@v4
+        with:
+          path: felixcommon/build/
+          key: felixcommon-${{ runner.os }}-${{ hashFiles('felixcommon/**/*.pro', 'felixcommon/**/CMakeLists.txt') }}
+
+      - name: Build L3 Widgets
+        run: |
+          chmod +x build_l3widgets.sh 2>/dev/null || true
+          if [ -f build_l3widgets.sh ]; then
+            ./build_l3widgets.sh
+          else
+            mkdir -p build && cd build && cmake .. -GNinja && ninja
+          fi
+
+      - name: Cache L3 build artifacts
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: l3widgets-build-${{ github.sha }}
+
+  unit-tests:
+    name: Unit Tests (QTest)
+    needs: build-l3s
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: l3widgets-build-${{ github.sha }}
+
+      - name: Run unit tests
+        run: |
+          mkdir -p unittestreports
+          if [ -f run_tests.sh ]; then
+            chmod +x run_tests.sh && ./run_tests.sh --xml unittestreports/
+          fi
+
+      - name: Upload unit test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: l3widgets-unit-tests-${{ github.run_id }}
+          path: unittestreports/
+          if-no-files-found: ignore
+
+      - name: Publish unit test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: unittestreports/**/*.xml
+          check_name: 'L3 Widgets Unit Tests'
+
+  # ── Step 7+8 (parallel with unit-tests): Robot Framework Tests ────────────
+  robot-tests:
+    name: Robot Framework Regression
+    needs: build-l3s
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: l3widgets-build-${{ github.sha }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: l3widgets-pip-${{ hashFiles('requirements*.txt') }}
+
+      - name: Run Robot Framework tests
+        run: |
+          pip install --quiet robotframework robotframework-seleniumlibrary
+          mkdir -p robotreports
+          ROBOT_FILE=$(find . -name "felixl3widgettests.robot" -o -name "*.robot" 2>/dev/null | head -1)
+          if [ -n "$ROBOT_FILE" ]; then
+            robot --outputdir robotreports/ --xunit robotreports/xunit.xml "$ROBOT_FILE" || true
+          fi
+
+      - name: Upload Robot results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: l3widgets-robot-${{ github.run_id }}
+          path: robotreports/
+          if-no-files-found: ignore
+
+      - name: Publish Robot results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: robotreports/xunit.xml
+          check_name: 'L3 Widgets Robot Tests'
+
+  # ── Step 9: Send results to Jira ─────────────────────────────────────────
+  notify-jira:
+    name: Notify Jira
+    needs: [unit-tests, robot-tests]
+    runs-on: [self-hosted, fps-ci]
+    if: always()
+    steps:
+      - name: Post results to Jira ticket
+        env:
+          JIRA_BASE_URL: https://payfelix.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_EMAIL: luis.walle@payfelix.com
+        run: |
+          TICKET=$(echo "${{ github.ref_name }}" | grep -oP '[A-Z]+-\d+' | head -1)
+          if [ -n "$TICKET" ]; then
+            UNIT="${{ needs.unit-tests.result }}"
+            ROBOT="${{ needs.robot-tests.result }}"
+            RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            BODY="CI Run for L3 Widgets | Unit: ${UNIT} | Robot: ${ROBOT} | Branch: ${{ github.ref_name }} | Run: ${RUN_URL}"
+            curl -sf -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              -X POST "${JIRA_BASE_URL}/rest/api/3/issue/${TICKET}/comment" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"${BODY}\"}]}]}}" || true
+          fi
+
+  # ── CD: Docker Push ────────────────────────────────────────────────────────
+  docker-push:
+    name: Docker Build & Push
+    needs: [unit-tests, robot-tests]
+    runs-on: [self-hosted, fps-ci]
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & push terminal image
+        run: |
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | cut -d'-' -f1,2 | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+          IMAGE="${{ env.REGISTRY }}:${{ env.TERMINAL_REGISTRY_PORT }}/${BRANCH_NAME}"
+          echo "${{ secrets.REGISTRY_PASS_TERMINAL }}" | docker login \
+            "${{ env.REGISTRY }}:${{ env.TERMINAL_REGISTRY_PORT }}" \
+            --username "${{ secrets.REGISTRY_USER }}" --password-stdin
+          docker build --progress=plain --no-cache -t "${IMAGE}" .
+          docker push "${IMAGE}"
+          docker logout "${{ env.REGISTRY }}:${{ env.TERMINAL_REGISTRY_PORT }}"

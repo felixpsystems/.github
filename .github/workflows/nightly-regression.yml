@@ -1,0 +1,127 @@
+name: Nightly Regression Suite
+
+on:
+  schedule:
+    # 2 AM UTC daily
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'Comma-separated repos to test (leave empty for all)'
+        required: false
+        default: ''
+
+jobs:
+  determine-matrix:
+    runs-on: [self-hosted, fps-ci]
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Build repo matrix
+        id: set-matrix
+        run: |
+          INPUT="${{ github.event.inputs.repos }}"
+          if [ -n "$INPUT" ]; then
+            REPOS="[$(echo $INPUT | sed 's/,/","/g' | sed 's/^/"/' | sed 's/$/"/' )]"
+          else
+            REPOS='["felixkernel","felixl3widgets","hector","felixcommon"]'
+          fi
+          echo "matrix={\"repo\":${REPOS}}" >> $GITHUB_OUTPUT
+          echo "Running nightly regression on: $REPOS"
+
+  nightly-build-test:
+    needs: determine-matrix
+    runs-on: [self-hosted, fps-ci, qt65]
+    strategy:
+      matrix: ${{ fromJson(needs.determine-matrix.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Checkout ${{ matrix.repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: felixpsystems/${{ matrix.repo }}
+          token: ${{ secrets.GH_PAT }}
+          submodules: recursive
+          ref: develop
+
+      - name: Sync submodule (felixcommon) to develop
+        run: |
+          if [ -d "felixcommon" ]; then
+            cd felixcommon && git fetch origin && git checkout develop
+          fi
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: nightly-${{ matrix.repo }}-${{ github.run_id }}
+          restore-keys: nightly-${{ matrix.repo }}-
+
+      - name: Build
+        run: |
+          BUILD_SCRIPT=$(ls build*.sh 2>/dev/null | head -1)
+          if [ -n "$BUILD_SCRIPT" ]; then
+            chmod +x "$BUILD_SCRIPT" && ./"$BUILD_SCRIPT"
+          else
+            echo "No build script found, skipping build step."
+          fi
+
+      - name: Run unit tests
+        run: |
+          mkdir -p unittestreports
+          if [ -f run_tests.sh ]; then
+            chmod +x run_tests.sh && ./run_tests.sh --xml unittestreports/ || true
+          fi
+
+      - name: Run Robot Framework tests
+        run: |
+          pip install --quiet robotframework robotframework-seleniumlibrary
+          mkdir -p robotreports
+          ROBOT_FILE=$(find . -name "*.robot" | head -1)
+          if [ -n "$ROBOT_FILE" ]; then
+            robot --outputdir robotreports/ --xunit robotreports/xunit.xml "$ROBOT_FILE" || true
+          fi
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-${{ matrix.repo }}-${{ github.run_id }}
+          path: |
+            unittestreports/
+            robotreports/
+          if-no-files-found: ignore
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: |
+            unittestreports/**/*.xml
+            robotreports/**/*.xml
+          check_name: 'Nightly — ${{ matrix.repo }}'
+
+      - name: Notify Jira on nightly failure
+        if: failure() && secrets.JIRA_API_TOKEN != ''
+        env:
+          JIRA_BASE_URL: https://payfelix.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_EMAIL: luis.walle@payfelix.com
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Post to a nightly-monitoring ticket if one exists
+          curl -s \
+            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+            -X POST \
+            "${JIRA_BASE_URL}/rest/api/3/issue/FELCLD-NIGHTLY/comment" \
+            -H "Content-Type: application/json" \
+            -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"❌ Nightly regression FAILED for ${{ matrix.repo }} — $(date -u '+%Y-%m-%d') | Run: ${RUN_URL}\"}]}]}}" || true

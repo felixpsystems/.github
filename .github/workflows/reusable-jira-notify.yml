@@ -1,0 +1,84 @@
+name: Reusable — Jira Notification
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        description: 'Job status (success, failure, cancelled)'
+        required: true
+        type: string
+      message-override:
+        description: 'Optional custom message body (replaces auto-generated)'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      JIRA_API_TOKEN:
+        required: true
+
+jobs:
+  notify-jira:
+    runs-on: [self-hosted, fps-ci]
+
+    steps:
+      - name: Extract Jira ticket from branch/commit
+        id: ticket
+        run: |
+          # Try branch name first (e.g. FELCLD-1234-my-feature)
+          TICKET=$(echo "${{ github.ref_name }}" | grep -oP '[A-Z]+-\d+' | head -1)
+          # Fall back to commit message
+          if [ -z "$TICKET" ]; then
+            TICKET=$(echo "${{ github.event.head_commit.message }}" | grep -oP '[A-Z]+-\d+' | head -1)
+          fi
+          echo "ticket=${TICKET}" >> $GITHUB_OUTPUT
+          echo "Found Jira ticket: ${TICKET:-none}"
+
+      - name: Post CI result to Jira
+        if: steps.ticket.outputs.ticket != ''
+        env:
+          JIRA_BASE_URL: https://payfelix.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_EMAIL: luis.walle@payfelix.com
+        run: |
+          TICKET="${{ steps.ticket.outputs.ticket }}"
+          STATUS="${{ inputs.status }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          REPO="${{ github.repository }}"
+          SHA="${{ github.sha }}"
+          REF="${{ github.ref_name }}"
+
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="✅"
+            STATUS_TEXT="PASSED"
+          elif [ "$STATUS" = "failure" ]; then
+            EMOJI="❌"
+            STATUS_TEXT="FAILED"
+          else
+            EMOJI="⚠️"
+            STATUS_TEXT="CANCELLED"
+          fi
+
+          if [ -n "${{ inputs.message-override }}" ]; then
+            BODY_TEXT="${{ inputs.message-override }}"
+          else
+            BODY_TEXT="${EMOJI} CI ${STATUS_TEXT} | Repo: ${REPO} | Branch: ${REF} | SHA: ${SHA:0:8} | [View Run](${RUN_URL})"
+          fi
+
+          curl -s -f \
+            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+            -X POST \
+            "${JIRA_BASE_URL}/rest/api/3/issue/${TICKET}/comment" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"body\": {
+                \"type\": \"doc\",
+                \"version\": 1,
+                \"content\": [{
+                  \"type\": \"paragraph\",
+                  \"content\": [{
+                    \"type\": \"text\",
+                    \"text\": \"${BODY_TEXT}\"
+                  }]
+                }]
+              }
+            }" && echo "✅ Jira comment posted to ${TICKET}" || echo "⚠️ Failed to post Jira comment (non-fatal)"

@@ -1,0 +1,79 @@
+name: Reusable — Robot Framework Tests
+
+on:
+  workflow_call:
+    inputs:
+      test-file:
+        description: 'Robot test file or directory'
+        required: false
+        default: 'tests.robot'
+        type: string
+      test-dir:
+        description: 'Working directory to run tests from'
+        required: false
+        default: '.'
+        type: string
+      output-dir:
+        description: 'Directory to save robot reports'
+        required: false
+        default: 'robotreports'
+        type: string
+      extra-pip-packages:
+        description: 'Space-separated extra pip packages to install'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      REGISTRY_USER:
+        required: false
+      REGISTRY_PASS:
+        required: false
+
+jobs:
+  robot-tests:
+    runs-on: [self-hosted, fps-ci, qt65]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Robot Framework dependencies
+        run: |
+          pip install --quiet \
+            robotframework \
+            robotframework-seleniumlibrary \
+            ${{ inputs.extra-pip-packages }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-robot-${{ hashFiles('requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-robot-
+
+      - name: Run Robot Framework tests
+        working-directory: ${{ inputs.test-dir }}
+        run: |
+          mkdir -p "${{ inputs.output-dir }}"
+          robot \
+            --outputdir "${{ inputs.output-dir }}" \
+            --xunit "${{ inputs.output-dir }}/xunit.xml" \
+            "${{ inputs.test-file }}"
+
+      - name: Upload Robot test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: robot-reports-${{ github.run_id }}
+          path: ${{ inputs.test-dir }}/${{ inputs.output-dir }}/
+          if-no-files-found: ignore
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: '${{ inputs.test-dir }}/${{ inputs.output-dir }}/xunit.xml'
+          check_name: 'Robot Framework Results'

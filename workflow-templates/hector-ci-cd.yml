@@ -1,0 +1,216 @@
+name: CI/CD — Hector
+
+on:
+  push:
+    branches:
+      - develop
+      - 'release/**'
+      - 'FELCLD-*'
+  pull_request:
+    branches:
+      - develop
+      - 'release/**'
+
+env:
+  REGISTRY: 10.10.100.86
+  CLOUD_REGISTRY_PORT: 5007
+  BASE_IMAGE: 10.10.100.86:5011/fps-ci-base:qt65
+
+concurrency:
+  group: hector-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── CI: Build & Unit Test ──────────────────────────────────────────────────
+  build-and-test:
+    name: Build & Test
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          cat ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Sync felixcommon submodule to matching branch
+        run: |
+          if [ -d "felixcommon" ]; then
+            cd felixcommon && git fetch origin
+            BRANCH="${{ github.head_ref || github.ref_name }}"
+            BASE="${{ github.base_ref || 'develop' }}"
+            if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
+              git checkout "${BRANCH}"
+            else
+              git checkout "${BASE}"
+            fi
+          fi
+
+      - name: Cache build
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: hector-${{ runner.os }}-${{ hashFiles('**/*.pro', '**/CMakeLists.txt') }}
+          restore-keys: hector-${{ runner.os }}-
+
+      - name: Build
+        run: |
+          BUILD_SCRIPT=$(ls build*.sh 2>/dev/null | head -1)
+          if [ -n "$BUILD_SCRIPT" ]; then
+            chmod +x "$BUILD_SCRIPT" && ./"$BUILD_SCRIPT"
+          else
+            mkdir -p build && cd build
+            cmake .. -GNinja && ninja
+          fi
+
+      - name: Unit Tests (QTest)
+        run: |
+          mkdir -p unittestreports
+          if [ -f run_tests.sh ]; then
+            chmod +x run_tests.sh
+            ./run_tests.sh --xml unittestreports/
+          fi
+
+      - name: Upload unit test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hector-unit-tests-${{ github.run_id }}
+          path: unittestreports/
+          if-no-files-found: ignore
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: unittestreports/**/*.xml
+          check_name: 'Hector Unit Tests'
+
+      - name: Notify Jira
+        if: always()
+        env:
+          JIRA_BASE_URL: https://payfelix.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_EMAIL: luis.walle@payfelix.com
+        run: |
+          TICKET=$(echo "${{ github.ref_name }}" | grep -oP '[A-Z]+-\d+' | head -1)
+          if [ -n "$TICKET" ]; then
+            STATUS="${{ job.status }}"
+            [ "$STATUS" = "success" ] && EMOJI="✅" || EMOJI="❌"
+            RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            curl -sf -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              -X POST "${JIRA_BASE_URL}/rest/api/3/issue/${TICKET}/comment" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"${EMOJI} hector CI ${STATUS} | Branch: ${{ github.ref_name }} | SHA: ${{ github.sha }} | Run: ${RUN_URL}\"}]}]}}" || true
+          fi
+
+  # ── CI: Robot Framework Regression ────────────────────────────────────────
+  robot-tests:
+    name: Robot Framework Regression
+    needs: build-and-test
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: hector-pip-${{ hashFiles('requirements*.txt') }}
+
+      - name: Run Robot tests
+        run: |
+          pip install --quiet robotframework robotframework-seleniumlibrary
+          mkdir -p robotreports
+          ROBOT_FILE=$(find . -name "*.robot" | head -1)
+          if [ -n "$ROBOT_FILE" ]; then
+            robot --outputdir robotreports/ --xunit robotreports/xunit.xml "$ROBOT_FILE" || true
+          fi
+
+      - name: Upload Robot results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hector-robot-${{ github.run_id }}
+          path: robotreports/
+          if-no-files-found: ignore
+
+      - name: Publish Robot results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: robotreports/xunit.xml
+          check_name: 'Hector Robot Tests'
+
+  # ── CD: Docker Push (develop & release branches only) ─────────────────────
+  docker-push:
+    name: Docker Build & Push
+    needs: [build-and-test, robot-tests]
+    runs-on: [self-hosted, fps-ci]
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build & push cloud image
+        run: |
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | cut -d'-' -f1,2 | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+          IMAGE="${{ env.REGISTRY }}:${{ env.CLOUD_REGISTRY_PORT }}/${BRANCH_NAME}"
+          echo "${{ secrets.REGISTRY_PASS_CLOUD }}" | docker login \
+            "${{ env.REGISTRY }}:${{ env.CLOUD_REGISTRY_PORT }}" \
+            --username "${{ secrets.REGISTRY_USER }}" --password-stdin
+          docker build --progress=plain --no-cache -t "${IMAGE}" -f Dockerfile.cloud . || \
+          docker build --progress=plain --no-cache -t "${IMAGE}" .
+          docker push "${IMAGE}"
+          docker logout "${{ env.REGISTRY }}:${{ env.CLOUD_REGISTRY_PORT }}"
+          echo "✅ Pushed: ${IMAGE}"
+
+  # ── CD: Deploy to Sandbox (develop only) ──────────────────────────────────
+  deploy-sandbox:
+    name: Deploy → Sandbox
+    needs: docker-push
+    runs-on: [self-hosted, fps-ci]
+    environment: sandbox
+    if: github.ref == 'refs/heads/develop'
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to sandbox via SSH
+        run: |
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | cut -d'-' -f1,2 | tr '[:upper:]' '[:lower:]')
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "docker pull ${{ env.REGISTRY }}:${{ env.CLOUD_REGISTRY_PORT }}/${BRANCH_NAME} && \
+             docker stop hector-sandbox 2>/dev/null || true && \
+             docker rm hector-sandbox 2>/dev/null || true && \
+             docker run -d --name hector-sandbox --restart unless-stopped \
+               ${{ env.REGISTRY }}:${{ env.CLOUD_REGISTRY_PORT }}/${BRANCH_NAME}"
+          rm -f /tmp/deploy_key
+          echo "✅ Deployed hector to sandbox"

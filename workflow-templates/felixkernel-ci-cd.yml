@@ -1,0 +1,211 @@
+name: CI/CD — Felix Kernel (L2)
+
+on:
+  push:
+    branches:
+      - develop
+      - 'release/**'
+      - 'FELCLD-*'
+  pull_request:
+    branches:
+      - develop
+      - 'release/**'
+
+env:
+  REGISTRY: 10.10.100.86
+  CLOUD_REGISTRY_PORT: 5007
+
+concurrency:
+  group: felixkernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Parallel: Clone + Build dependencies ─────────────────────────────────
+  clone-and-build:
+    name: Clone, Build & Test
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          cat ~/.ssh/known_hosts 2>/dev/null || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Sync felixcommon to matching branch
+        run: |
+          if [ -d "felixcommon" ]; then
+            cd felixcommon && git fetch origin
+            BRANCH="${{ github.head_ref || github.ref_name }}"
+            BASE="${{ github.base_ref || 'develop' }}"
+            if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
+              git checkout "${BRANCH}"
+            else
+              git checkout "${BASE}"
+            fi
+          fi
+
+      - name: Cache git installation
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/git
+          key: git-cache-${{ runner.os }}
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: felixkernel-${{ runner.os }}-${{ hashFiles('**/*.pro', '**/CMakeLists.txt', 'build*.sh') }}
+          restore-keys: felixkernel-${{ runner.os }}-
+
+      - name: Build felixcommon
+        run: |
+          if [ -d "felixcommon" ]; then
+            cd felixcommon
+            chmod +x build_common.sh 2>/dev/null || true
+            if [ -f build_common.sh ]; then
+              ./build_common.sh
+            else
+              mkdir -p build && cd build && cmake .. -GNinja && ninja
+            fi
+          fi
+
+      - name: Build felixkernel (L2/L3)
+        run: |
+          # Try build_l2l3_testing.sh first (per BB pipeline docs), then fallback
+          if [ -f build_l2l3_testing.sh ]; then
+            chmod +x build_l2l3_testing.sh && ./build_l2l3_testing.sh
+          elif [ -f build_l2l3_dep_logger.sh ]; then
+            chmod +x build_l2l3_dep_logger.sh && ./build_l2l3_dep_logger.sh
+          else
+            mkdir -p build && cd build && cmake .. -GNinja && ninja
+          fi
+
+      - name: Run unit tests
+        run: |
+          mkdir -p unittestreports
+          if [ -f run_tests.sh ]; then
+            chmod +x run_tests.sh && ./run_tests.sh --xml unittestreports/ || true
+          fi
+
+      - name: Upload unit test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: felixkernel-unit-tests-${{ github.run_id }}
+          path: unittestreports/
+          if-no-files-found: ignore
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: unittestreports/**/*.xml
+          check_name: 'FelixKernel Unit Tests'
+
+  # ── Parallel with unit-tests: Robot Framework ────────────────────────────
+  robot-tests:
+    name: Robot Framework (FelixCloudKernelWorker)
+    needs: clone-and-build
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: 10.10.100.86:5011/fps-ci-base:qt65
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS_QA }}
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: felixkernel-${{ runner.os }}-${{ hashFiles('**/*.pro', '**/CMakeLists.txt', 'build*.sh') }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: felixkernel-pip-${{ hashFiles('requirements*.txt') }}
+
+      - name: Run Robot Framework tests
+        run: |
+          pip install --quiet robotframework robotframework-seleniumlibrary
+          mkdir -p robotreports
+          if [ -d "FelixCloudKernelWorker" ]; then
+            cd FelixCloudKernelWorker
+            robot --outputdir ../robotreports/ --xunit ../robotreports/xunit.xml tests.robot || true
+          else
+            ROBOT_FILE=$(find . -name "*.robot" | head -1)
+            [ -n "$ROBOT_FILE" ] && robot --outputdir robotreports/ --xunit robotreports/xunit.xml "$ROBOT_FILE" || true
+          fi
+
+      - name: Upload Robot results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: felixkernel-robot-${{ github.run_id }}
+          path: robotreports/
+          if-no-files-found: ignore
+
+      - name: Publish Robot results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: robotreports/xunit.xml
+          check_name: 'FelixKernel Robot Tests'
+
+      - name: Notify Jira
+        if: always()
+        env:
+          JIRA_BASE_URL: https://payfelix.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_EMAIL: luis.walle@payfelix.com
+        run: |
+          TICKET=$(echo "${{ github.ref_name }}" | grep -oP '[A-Z]+-\d+' | head -1)
+          if [ -n "$TICKET" ]; then
+            RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            STATUS="${{ job.status }}"
+            [ "$STATUS" = "success" ] && EMOJI="✅" || EMOJI="❌"
+            curl -sf -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              -X POST "${JIRA_BASE_URL}/rest/api/3/issue/${TICKET}/comment" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"${EMOJI} felixkernel CI ${STATUS} | ${RUN_URL}\"}]}]}}" || true
+          fi
+
+  # ── CD: Docker Push ────────────────────────────────────────────────────────
+  docker-push:
+    name: Docker Build & Push
+    needs: [clone-and-build, robot-tests]
+    runs-on: [self-hosted, fps-ci]
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & push cloud image
+        run: |
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | cut -d'-' -f1,2 | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+          IMAGE="${{ env.REGISTRY }}:${{ env.CLOUD_REGISTRY_PORT }}/${BRANCH_NAME}"
+          echo "${{ secrets.REGISTRY_PASS_CLOUD }}" | docker login \
+            "${{ env.REGISTRY }}:${{ env.CLOUD_REGISTRY_PORT }}" \
+            --username "${{ secrets.REGISTRY_USER }}" --password-stdin
+          docker build --progress=plain --no-cache -t "${IMAGE}" .
+          docker push "${IMAGE}"
+          docker logout "${{ env.REGISTRY }}:${{ env.CLOUD_REGISTRY_PORT }}"

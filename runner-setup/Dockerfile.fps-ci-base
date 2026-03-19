@@ -1,0 +1,78 @@
+# fps-ci-base — Felix Payments CI Base Image
+# Includes: QT 6.5, cmake, ninja, Robot Framework, sshpass, ssh-keyscan
+# Push to: 10.10.100.86:5011/fps-ci-base:qt65
+#
+# Build:
+#   docker build -t 10.10.100.86:5011/fps-ci-base:qt65 -f Dockerfile.fps-ci-base .
+#   docker push 10.10.100.86:5011/fps-ci-base:qt65
+#
+# Rebuild when: QT version changes, SKB version changes, new system deps required
+
+FROM ubuntu:22.04
+
+ARG QT_VERSION=6.5.3
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL org.felixpayments.image="fps-ci-base" \
+      org.felixpayments.qt-version="${QT_VERSION}" \
+      org.felixpayments.registry="10.10.100.86:5011"
+
+# ── System dependencies ──────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build tools
+    build-essential \
+    cmake \
+    ninja-build \
+    pkg-config \
+    # QT 6.5 runtime and dev libs
+    qt6-base-dev \
+    qt6-base-private-dev \
+    qt6-tools-dev \
+    qt6-tools-dev-tools \
+    libqt6core6 \
+    libqt6network6 \
+    libqt6sql6 \
+    libqt6test6 \
+    libqt6xml6 \
+    # SSH and Git
+    git \
+    openssh-client \
+    sshpass \
+    # Python / Robot Framework deps
+    python3 \
+    python3-pip \
+    python3-venv \
+    # Misc utils
+    curl \
+    wget \
+    unzip \
+    jq \
+    ca-certificates \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Robot Framework ──────────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+    robotframework \
+    robotframework-seleniumlibrary \
+    requests
+
+# ── SKB (Secure Key Box) placeholder ─────────────────────────────────────────
+# In production: COPY your SKB binaries/libs here.
+# The COPY below is commented out as this is a template.
+# COPY skb/ /opt/skb/
+# ENV SKB_HOME=/opt/skb
+# ENV PATH="${SKB_HOME}/bin:${PATH}"
+# ENV LD_LIBRARY_PATH="${SKB_HOME}/lib:${LD_LIBRARY_PATH}"
+
+# ── SSH known_hosts pre-seeding ───────────────────────────────────────────────
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh \
+    && ssh-keyscan -H github.com >> /root/.ssh/known_hosts 2>/dev/null \
+    && ssh-keyscan -H bitbucket.org >> /root/.ssh/known_hosts 2>/dev/null \
+    && chmod 644 /root/.ssh/known_hosts
+
+# ── Workspace ────────────────────────────────────────────────────────────────
+WORKDIR /workspace
+
+# ── Healthcheck ──────────────────────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=10s CMD qmake6 --version || exit 1

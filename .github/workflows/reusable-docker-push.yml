@@ -1,0 +1,97 @@
+name: Reusable — Docker Build & Push
+
+on:
+  workflow_call:
+    inputs:
+      registry-host:
+        description: 'Private Docker registry host IP'
+        required: false
+        default: '10.10.100.86'
+        type: string
+      registry-port:
+        description: 'Registry port for this image type (e.g. 5007 for cloud)'
+        required: true
+        type: string
+      dockerfile:
+        description: 'Path to Dockerfile'
+        required: false
+        default: 'Dockerfile'
+        type: string
+      docker-context:
+        description: 'Docker build context path'
+        required: false
+        default: '.'
+        type: string
+      image-name-from-branch:
+        description: 'Derive image name from branch (cuts first 2 segments, lowercases)'
+        required: false
+        default: true
+        type: boolean
+      image-name:
+        description: 'Override image name (used if image-name-from-branch is false)'
+        required: false
+        default: ''
+        type: string
+      build-args:
+        description: 'Docker build args as newline-separated KEY=VALUE pairs'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      REGISTRY_USER:
+        required: true
+      REGISTRY_PASS:
+        required: true
+
+jobs:
+  docker-push:
+    runs-on: [self-hosted, fps-ci]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [ "${{ inputs.image-name-from-branch }}" = "true" ]; then
+            IMAGE_NAME=$(echo "${{ github.ref_name }}" | cut -d'-' -f1,2 | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+          else
+            IMAGE_NAME="${{ inputs.image-name }}"
+          fi
+          FULL_TAG="${{ inputs.registry-host }}:${{ inputs.registry-port }}/${IMAGE_NAME}"
+          echo "image-name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "full-tag=${FULL_TAG}" >> $GITHUB_OUTPUT
+          echo "Building image: ${FULL_TAG}"
+
+      - name: Login to private registry
+        run: |
+          echo "${{ secrets.REGISTRY_PASS }}" | docker login \
+            "${{ inputs.registry-host }}:${{ inputs.registry-port }}" \
+            --username "${{ secrets.REGISTRY_USER }}" \
+            --password-stdin
+
+      - name: Build Docker image
+        run: |
+          BUILD_ARGS=""
+          if [ -n "${{ inputs.build-args }}" ]; then
+            while IFS= read -r arg; do
+              BUILD_ARGS="$BUILD_ARGS --build-arg $arg"
+            done <<< "${{ inputs.build-args }}"
+          fi
+          docker build \
+            --progress=plain \
+            --no-cache \
+            $BUILD_ARGS \
+            -t "${{ steps.tag.outputs.full-tag }}" \
+            -f "${{ inputs.dockerfile }}" \
+            "${{ inputs.docker-context }}"
+
+      - name: Push Docker image
+        run: |
+          docker push "${{ steps.tag.outputs.full-tag }}"
+          echo "✅ Pushed: ${{ steps.tag.outputs.full-tag }}"
+
+      - name: Logout from registry
+        if: always()
+        run: docker logout "${{ inputs.registry-host }}:${{ inputs.registry-port }}"

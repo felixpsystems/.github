@@ -1,0 +1,169 @@
+name: Reusable — C++ Build & Test
+
+on:
+  workflow_call:
+    inputs:
+      qt-version:
+        description: 'QT version tag for base image (e.g. qt65)'
+        required: false
+        default: 'qt65'
+        type: string
+      registry-host:
+        description: 'Private Docker registry host'
+        required: false
+        default: '10.10.100.86'
+        type: string
+      registry-port:
+        description: 'Registry port for build artifacts'
+        required: false
+        default: '5011'
+        type: string
+      build-script:
+        description: 'Build script to run (relative to repo root)'
+        required: false
+        default: 'build.sh'
+        type: string
+      run-robot-tests:
+        description: 'Whether to run Robot Framework regression tests'
+        required: false
+        default: true
+        type: boolean
+      robot-test-file:
+        description: 'Robot test file to run'
+        required: false
+        default: 'tests.robot'
+        type: string
+      has-submodules:
+        description: 'Whether the repo uses git submodules'
+        required: false
+        default: true
+        type: boolean
+      submodule-name:
+        description: 'Submodule directory name for branch matching (e.g. felixcommon)'
+        required: false
+        default: 'felixcommon'
+        type: string
+    secrets:
+      GH_PAT:
+        required: true
+      SSH_PRIVATE_KEY:
+        required: true
+      REGISTRY_USER:
+        required: false
+      REGISTRY_PASS:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, fps-ci, qt65]
+    container:
+      image: ${{ inputs.registry-host }}:${{ inputs.registry-port }}/fps-ci-base:${{ inputs.qt-version }}
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASS }}
+
+    steps:
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          ssh-keyscan -H bitbucket.org >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.has-submodules }}
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Sync submodule to matching branch
+        if: inputs.has-submodules
+        run: |
+          SUBMODULE="${{ inputs.submodule-name }}"
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          BASE_BRANCH="${{ github.base_ref || 'develop' }}"
+          if [ -d "$SUBMODULE" ]; then
+            cd "$SUBMODULE"
+            git fetch origin
+            if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
+              echo "Checking out matching branch: ${BRANCH}"
+              git checkout "${BRANCH}"
+            else
+              echo "No matching branch — using base: ${BASE_BRANCH}"
+              git checkout "${BASE_BRANCH}"
+            fi
+          fi
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/
+            ~/.cache/
+          key: ${{ runner.os }}-cpp-${{ inputs.qt-version }}-${{ hashFiles('**/*.pro', '**/CMakeLists.txt', '**/build*.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-cpp-${{ inputs.qt-version }}-
+
+      - name: Run build
+        run: |
+          chmod +x ${{ inputs.build-script }}
+          ./${{ inputs.build-script }}
+
+      - name: Run unit tests (QTest)
+        id: unit-tests
+        run: |
+          mkdir -p unittestreports
+          if [ -f run_tests.sh ]; then
+            chmod +x run_tests.sh
+            ./run_tests.sh --xml unittestreports/ || echo "UNIT_FAIL=true" >> $GITHUB_ENV
+          fi
+
+      - name: Upload unit test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results-${{ github.run_id }}
+          path: unittestreports/
+          if-no-files-found: ignore
+
+      - name: Run Robot Framework regression tests
+        if: inputs.run-robot-tests
+        run: |
+          pip install --quiet robotframework robotframework-seleniumlibrary
+          mkdir -p robotreports
+          if [ -f "${{ inputs.robot-test-file }}" ]; then
+            robot --outputdir robotreports/ ${{ inputs.robot-test-file }} || echo "ROBOT_FAIL=true" >> $GITHUB_ENV
+          else
+            echo "No robot test file found at ${{ inputs.robot-test-file }}, skipping."
+          fi
+
+      - name: Upload Robot Framework results
+        uses: actions/upload-artifact@v4
+        if: always() && inputs.run-robot-tests
+        with:
+          name: robot-test-results-${{ github.run_id }}
+          path: robotreports/
+          if-no-files-found: ignore
+
+      - name: Publish test results summary
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: |
+            unittestreports/**/*.xml
+            robotreports/**/*.xml
+          check_name: 'C++ Test Results'
+          comment_mode: always
+
+      - name: Notify Jira on completion
+        if: always() && secrets.JIRA_API_TOKEN != ''
+        uses: felixpsystems/.github/.github/workflows/reusable-jira-notify.yml@main
+        with:
+          status: ${{ job.status }}
+        secrets:
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}

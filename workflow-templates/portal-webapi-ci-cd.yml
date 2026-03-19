@@ -1,0 +1,127 @@
+name: CI/CD — Felix Portal Web API (Node.js)
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'FELCLD-*'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: portal-webapi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── CI: Lint & Test ────────────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: [self-hosted, fps-ci]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Run tests
+        run: |
+          npm test -- \
+            --reporter=junit \
+            --reporter-option="outputFile=test-results.xml" \
+            2>/dev/null || npm test
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: portal-webapi-tests-${{ github.run_id }}
+          path: test-results.xml
+          if-no-files-found: ignore
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: test-results.xml
+          check_name: 'Portal Web API Tests'
+
+      - name: Notify Jira
+        if: always()
+        env:
+          JIRA_BASE_URL: https://payfelix.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_EMAIL: luis.walle@payfelix.com
+        run: |
+          TICKET=$(echo "${{ github.ref_name }}" | grep -oP '[A-Z]+-\d+' | head -1)
+          if [ -n "$TICKET" ]; then
+            RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            STATUS="${{ job.status }}"
+            [ "$STATUS" = "success" ] && EMOJI="✅" || EMOJI="❌"
+            curl -sf -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              -X POST "${JIRA_BASE_URL}/rest/api/3/issue/${TICKET}/comment" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"${EMOJI} Portal API CI ${STATUS} | ${RUN_URL}\"}]}]}}" || true
+          fi
+
+  # ── CD: Deploy to Sandbox (develop) ────────────────────────────────────────
+  deploy-sandbox:
+    name: Deploy → Sandbox Portal
+    needs: test
+    runs-on: [self-hosted, fps-ci]
+    environment: sandbox
+    if: github.ref == 'refs/heads/develop'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to sandbox portal server
+        run: |
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          ssh -i /tmp/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+              "cd /app/portal-webapi && \
+               git fetch origin && git reset --hard origin/develop && \
+               npm ci --production && \
+               pm2 restart portal-webapi || pm2 start npm --name portal-webapi -- start"
+          rm -f /tmp/deploy_key
+          echo "✅ Deployed portal-webapi to sandbox: ${{ secrets.DEPLOY_HOST }}"
+
+  # ── CD: Deploy to UAT (release branches) ──────────────────────────────────
+  deploy-uat:
+    name: Deploy → UAT Portal
+    needs: test
+    runs-on: [self-hosted, fps-ci]
+    environment: uat
+    if: startsWith(github.ref, 'refs/heads/release/')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to UAT portal server
+        run: |
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          ssh -i /tmp/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+              "cd /app/portal-webapi && \
+               git fetch origin && git reset --hard origin/${{ github.ref_name }} && \
+               npm ci --production && \
+               pm2 restart portal-webapi || pm2 start npm --name portal-webapi -- start"
+          rm -f /tmp/deploy_key
+          echo "✅ Deployed portal-webapi to UAT: ${{ secrets.DEPLOY_HOST }}"
